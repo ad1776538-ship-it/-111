@@ -9,20 +9,21 @@ from telegram.ext import (
 from telegram.constants import ChatAction
 from mistralai import Mistral
 import re
+import os
 
-TOKEN = "8699789330:AAErx6x530YblxPi9x_tRRhDFsZ8b6s0Wvc"
-MISTRAL_KEY = "exhmzbfqfObMXGzRWnoegszu17lseJfM"
-BOT_USERNAME = "@lyadovgpt_bot"
-ADMIN_ID = 1033698004
+# ================== CONFIG ==================
+TOKEN = os.getenv("TOKEN", "8699789330:AAErx6x530YblxPi9x_tRRhDFsZ8b6s0Wvc")
+MISTRAL_KEY = os.getenv("MISTRAL_KEY", "exhmzbfqfObMXGzRWnoegszu17lseJfM")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "@lyadovgpt_bot")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1033698004"))
 
 client = Mistral(api_key=MISTRAL_KEY)
 
-# память пользователей
-memory = {}  # {user_id: [messages]}
+# ================== MEMORY ==================
+memory = {}
 users = set()
 
 
-# ---------- MEMORY ----------
 def get_memory(user_id: int):
     if user_id not in memory:
         memory[user_id] = []
@@ -33,23 +34,27 @@ def reset_memory(user_id: int):
     memory[user_id] = []
 
 
-# ---------- UI MENU ----------
+# ================== UI MENU ==================
 menu_keyboard = ReplyKeyboardMarkup(
     [["/start", "/reset"]],
     resize_keyboard=True
 )
 
 
-# ---------- BOT MENTION CHECK ----------
-def is_mentioned(update: Update):
-    text = update.message.text or ""
+# ================== TRIGGER LOGIC ==================
+def should_reply(update: Update):
+    message = update.message
+    if not message:
+        return False
 
-    if BOT_USERNAME.lower() in text.lower():
+    text = message.text or ""
+
+    if BOT_USERNAME and BOT_USERNAME.lower() in text.lower():
         return True
 
-    if update.message.reply_to_message:
+    if message.reply_to_message:
         try:
-            if update.message.reply_to_message.from_user.id == update.get_bot().id:
+            if message.reply_to_message.from_user.id == update.get_bot().id:
                 return True
         except:
             pass
@@ -57,7 +62,7 @@ def is_mentioned(update: Update):
     return False
 
 
-# ---------- START ----------
+# ================== COMMANDS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users.add(update.effective_chat.id)
 
@@ -67,10 +72,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- RESET MEMORY ----------
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    reset_memory(user_id)
+    reset_memory(update.effective_user.id)
 
     await update.message.reply_text(
         "Память очищена 🧠",
@@ -78,21 +81,24 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- PHOTO HANDLER ----------
+# ================== PHOTO HANDLER ==================
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users.add(update.effective_chat.id)
 
-    await update.message.reply_text("Я пока не могу рассматривать фотографии 📷")
+    if not should_reply(update):
+        return
+
+    await update.message.reply_text(
+        "Я не могу рассматривать фотографии 📷"
+    )
 
 
-# ---------- MAIN REPLY ----------
+# ================== TEXT HANDLER ==================
 async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users.add(update.effective_chat.id)
 
-    user_id = update.effective_user.id
-
     if update.effective_chat.type in ["group", "supergroup"]:
-        if not is_mentioned(update):
+        if not should_reply(update):
             return
 
     msg = update.message.text or ""
@@ -104,24 +110,26 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flags=re.IGNORECASE
     ).strip()
 
-    # ---------- MEMORY LOAD ----------
-    history = get_memory(user_id)
-
-    history.append({"role": "user", "content": clean_msg})
-
-    # ограничим память (последние 10 сообщений)
-    history = history[-10:]
-    memory[user_id] = history
-
     await update.message.chat.send_action(ChatAction.TYPING)
 
     try:
+        history = get_memory(update.effective_user.id)
+
+        history.append({"role": "user", "content": clean_msg})
+        history = history[-10:]
+        memory[update.effective_user.id] = history
+
         r = client.chat.complete(
             model="mistral-small-latest",
             messages=[
                 {
                     "role": "system",
-                    "content": "Ты ЛядовGPT. Отвечай кратко, на русском."
+                    "content": (
+                        "Ты ЛядовGPT — чат-бот. "
+                        "Ты представляешься как Даниил Лядов, родился 26 ноября 2010 года. "
+                        "Отвечай средне по длине: не слишком коротко и не слишком длинно. "
+                        "Пиши на русском, понятно и по делу."
+                    )
                 },
                 *history
             ]
@@ -130,7 +138,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         answer = r.choices[0].message.content
 
         history.append({"role": "assistant", "content": answer})
-        memory[user_id] = history[-10:]
+        memory[update.effective_user.id] = history[-10:]
 
         await update.message.reply_text(answer)
 
@@ -139,7 +147,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ошибка API")
 
 
-# ---------- SEND ALL (ADMIN) ----------
+# ================== ADMIN SEND ==================
 async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -156,7 +164,7 @@ async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 
-# ---------- APP ----------
+# ================== APP ==================
 app = ApplicationBuilder().token(TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
