@@ -1,4 +1,4 @@
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, BotCommand
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -7,168 +7,372 @@ from telegram.ext import (
     filters,
 )
 from telegram.constants import ChatAction
-from mistralai import Mistral
-import re
+
+from openai import OpenAI
+from PIL import Image
+
+import tempfile
 import os
+import re
+import base64
 
-# ================== CONFIG ==================
-TOKEN = os.getenv("TOKEN", "8699789330:AAErx6x530YblxPi9x_tRRhDFsZ8b6s0Wvc")
-MISTRAL_KEY = os.getenv("MISTRAL_KEY", "exhmzbfqfObMXGzRWnoegszu17lseJfM")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "@lyadovgpt_bot")  # без @ или с @ — не важно
-ADMIN_ID = int(os.getenv("ADMIN_ID", "1033698004"))
+# =========================================
+# CONFIG
+# =========================================
 
-client = Mistral(api_key=MISTRAL_KEY)
+TOKEN = os.getenv("8699789330:AAErx6x530YblxPi9x_tRRhDFsZ8b6s0Wvc")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# ================== MEMORY ==================
+BOT_USERNAME = "@lyadovgpt_bot"
+ADMIN_ID = 1033698004
+
+# =========================================
+# OPENROUTER
+# =========================================
+
+client = OpenAI(
+    api_key=GEMINI_API_KEY,
+    base_url="https://openrouter.ai/api/v1"
+)
+
+MODEL = "google/gemini-2.5-flash-lite"
+
+# =========================================
+# MEMORY
+# =========================================
+
 memory = {}
 users = set()
+
 
 def get_memory(user_id: int):
     if user_id not in memory:
         memory[user_id] = []
+
     return memory[user_id]
+
 
 def reset_memory(user_id: int):
     memory[user_id] = []
 
-# ================== UI ==================
+
+# =========================================
+# MENU
+# =========================================
+
 menu_keyboard = ReplyKeyboardMarkup(
-    [["/start", "/reset"]],
+    [
+        ["/start", "/reset"],
+    ],
     resize_keyboard=True
 )
 
-# ================== TRIGGER LOGIC ==================
-def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg:
-        return False
+# =========================================
+# CHECK MENTION
+# =========================================
 
-    text = (msg.text or "").lower()
-    bot_username = (BOT_USERNAME or "").lower().replace("@", "")
+async def is_mentioned(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        update.message.text
+        or update.message.caption
+        or ""
+    )
 
-    # 1. упоминание
-    if bot_username and bot_username in text:
+    if BOT_USERNAME.lower() in text.lower():
         return True
 
-    # 2. reply на бота (ПРАВИЛЬНО через context.bot.id)
-    if msg.reply_to_message:
+    if update.message.reply_to_message:
         try:
-            if msg.reply_to_message.from_user.id == context.bot.id:
+            me = await context.bot.get_me()
+
+            if update.message.reply_to_message.from_user.id == me.id:
                 return True
+
         except:
             pass
 
     return False
 
-# ================== COMMANDS ==================
+
+# =========================================
+# START
+# =========================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users.add(update.effective_chat.id)
 
     await update.message.reply_text(
-        "Привет! Я ЛядовGPT 🤖",
+        "Привет! Я ЛядовGPT 🤖\n\n"
+        "🧠 Помню диалог\n"
+        "📷 Умею распознавать фото\n"
+        "💬 Отвечаю на сообщения",
         reply_markup=menu_keyboard
     )
 
+
+# =========================================
+# RESET
+# =========================================
+
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reset_memory(update.effective_user.id)
+    user_id = update.effective_user.id
+
+    reset_memory(user_id)
 
     await update.message.reply_text(
         "Память очищена 🧠",
         reply_markup=menu_keyboard
     )
 
-# ================== PHOTO ==================
+
+# =========================================
+# PHOTO
+# =========================================
+
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users.add(update.effective_chat.id)
 
-    if not should_reply(update, context):
-        return
+    user_id = update.effective_user.id
 
-    await update.message.reply_text(
-        "Я не могу рассматривать фотографии 📷"
-    )
+    if update.effective_chat.type in ["group", "supergroup"]:
+        if not await is_mentioned(update, context):
+            return
 
-# ================== TEXT ==================
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    try:
+        photo = update.message.photo[-1]
+
+        file = await context.bot.get_file(photo.file_id)
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=".jpg"
+        ) as tf:
+            temp_path = tf.name
+
+        await file.download_to_drive(temp_path)
+
+        caption = (
+            update.message.caption
+            or "Опиши подробно что изображено на фото."
+        )
+
+        history = get_memory(user_id)
+
+        prompt = []
+
+        prompt.append(
+            "Ты ЛядовGPT. "
+            "Отвечай кратко, понятно и на русском."
+        )
+
+        for m in history[-10:]:
+            prompt.append(
+                f"{m['role']}: {m['content']}"
+            )
+
+        prompt.append(caption)
+
+        with open(temp_path, "rb") as img_file:
+            image_base64 = base64.b64encode(
+                img_file.read()
+            ).decode("utf-8")
+
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "\n".join(prompt)
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }
+                        }
+                    ]
+                }
+            ]
+        )
+
+        answer = response.choices[0].message.content
+
+        history.append({
+            "role": "user",
+            "content": f"[Фото]: {caption}"
+        })
+
+        history.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        memory[user_id] = history[-10:]
+
+        await update.message.reply_text(answer)
+
+        os.remove(temp_path)
+
+    except Exception as e:
+        print(e)
+
+        await update.message.reply_text(
+            "Ошибка обработки фото 📷"
+        )
+
+
+# =========================================
+# TEXT
+# =========================================
+
 async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users.add(update.effective_chat.id)
 
-    # в группах отвечаем только при триггере
+    user_id = update.effective_user.id
+
     if update.effective_chat.type in ["group", "supergroup"]:
-        if not should_reply(update, context):
+        if not await is_mentioned(update, context):
             return
 
     msg = update.message.text or ""
 
-    bot_username = (BOT_USERNAME or "").replace("@", "")
-
     clean_msg = re.sub(
-        rf"@?{re.escape(bot_username)}\s*",
+        rf"{re.escape(BOT_USERNAME)}\s*",
         "",
         msg,
         flags=re.IGNORECASE
     ).strip()
 
+    history = get_memory(user_id)
+
+    history.append({
+        "role": "user",
+        "content": clean_msg
+    })
+
+    memory[user_id] = history[-10:]
+
     await update.message.chat.send_action(ChatAction.TYPING)
 
     try:
-        history = get_memory(update.effective_user.id)
+        prompt = []
 
-        history.append({"role": "user", "content": clean_msg})
-        history = history[-10:]
-        memory[update.effective_user.id] = history
+        prompt.append(
+            "Ты ЛядовGPT. "
+            "Отвечай кратко, понятно и на русском."
+        )
 
-        r = client.chat.complete(
-            model="mistral-small-latest",
+        for m in history[-10:]:
+            prompt.append(
+                f"{m['role']}: {m['content']}"
+            )
+
+        response = client.chat.completions.create(
+            model=MODEL,
             messages=[
                 {
-                    "role": "system",
-                    "content": (
-                        "Ты ЛядовGPT — дружелюбный чат-бот. "
-                        "Ты представляешься как Даниил Лядов, родился 26 ноября 2010 года. "
-                        "Отвечай средне по длине: не слишком коротко и не слишком длинно. "
-                        "Пиши по-русски, понятно и по делу."
-                    )
-                },
-                *history
+                    "role": "user",
+                    "content": "\n".join(prompt)
+                }
             ]
         )
 
-        answer = r.choices[0].message.content
+        answer = response.choices[0].message.content
 
-        history.append({"role": "assistant", "content": answer})
-        memory[update.effective_user.id] = history[-10:]
+        history.append({
+            "role": "assistant",
+            "content": answer
+        })
+
+        memory[user_id] = history[-10:]
 
         await update.message.reply_text(answer)
 
     except Exception as e:
         print(e)
-        await update.message.reply_text("Ошибка API")
 
-# ================== ADMIN ==================
+        await update.message.reply_text(
+            "Ошибка OpenRouter API"
+        )
+
+
+# =========================================
+# SEND ALL
+# =========================================
+
 async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    if not update.message.text.startswith("/send "):
+    text = update.message.text
+
+    if not text.startswith("/send "):
         return
 
-    msg = update.message.text[6:]
+    msg = text[6:]
+
+    sent = 0
 
     for uid in users:
         try:
             await context.bot.send_message(uid, msg)
+            sent += 1
+
         except:
             pass
 
-# ================== APP ==================
-app = ApplicationBuilder().token(TOKEN).build()
+    await update.message.reply_text(
+        f"Отправлено: {sent}"
+    )
+
+
+# =========================================
+# COMMANDS
+# =========================================
+
+async def post_init(application):
+    commands = [
+        BotCommand("start", "Запустить бота"),
+        BotCommand("reset", "Очистить память"),
+    ]
+
+    await application.bot.set_my_commands(commands)
+
+
+# =========================================
+# APP
+# =========================================
+
+app = (
+    ApplicationBuilder()
+    .token(TOKEN)
+    .post_init(post_init)
+    .build()
+)
 
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CommandHandler("reset", reset))
 app.add_handler(CommandHandler("send", send_all))
 
-app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
+app.add_handler(
+    MessageHandler(
+        filters.PHOTO,
+        photo_handler
+    )
+)
 
-print("Бот запущен")
+app.add_handler(
+    MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        reply
+    )
+)
+
+print("Бот запущен 🚀")
+
 app.run_polling()
