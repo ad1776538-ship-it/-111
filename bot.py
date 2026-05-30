@@ -14,7 +14,7 @@ import os
 # ================== CONFIG ==================
 TOKEN = os.getenv("TOKEN", "8699789330:AAErx6x530YblxPi9x_tRRhDFsZ8b6s0Wvc")
 MISTRAL_KEY = os.getenv("MISTRAL_KEY", "exhmzbfqfObMXGzRWnoegszu17lseJfM")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "@lyadovgpt_bot")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "@lyadovgpt_bot")  # без @ или с @ — не важно
 ADMIN_ID = int(os.getenv("ADMIN_ID", "1033698004"))
 
 client = Mistral(api_key=MISTRAL_KEY)
@@ -23,44 +23,42 @@ client = Mistral(api_key=MISTRAL_KEY)
 memory = {}
 users = set()
 
-
 def get_memory(user_id: int):
     if user_id not in memory:
         memory[user_id] = []
     return memory[user_id]
 
-
 def reset_memory(user_id: int):
     memory[user_id] = []
 
-
-# ================== UI MENU ==================
+# ================== UI ==================
 menu_keyboard = ReplyKeyboardMarkup(
     [["/start", "/reset"]],
     resize_keyboard=True
 )
 
-
 # ================== TRIGGER LOGIC ==================
-def should_reply(update: Update):
-    message = update.message
-    if not message:
+def should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
         return False
 
-    text = message.text or ""
+    text = (msg.text or "").lower()
+    bot_username = (BOT_USERNAME or "").lower().replace("@", "")
 
-    if BOT_USERNAME and BOT_USERNAME.lower() in text.lower():
+    # 1. упоминание
+    if bot_username and bot_username in text:
         return True
 
-    if message.reply_to_message:
+    # 2. reply на бота (ПРАВИЛЬНО через context.bot.id)
+    if msg.reply_to_message:
         try:
-            if message.reply_to_message.from_user.id == update.get_bot().id:
+            if msg.reply_to_message.from_user.id == context.bot.id:
                 return True
         except:
             pass
 
     return False
-
 
 # ================== COMMANDS ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -71,7 +69,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=menu_keyboard
     )
 
-
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_memory(update.effective_user.id)
 
@@ -80,31 +77,32 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=menu_keyboard
     )
 
-
-# ================== PHOTO HANDLER ==================
+# ================== PHOTO ==================
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users.add(update.effective_chat.id)
 
-    if not should_reply(update):
+    if not should_reply(update, context):
         return
 
     await update.message.reply_text(
         "Я не могу рассматривать фотографии 📷"
     )
 
-
-# ================== TEXT HANDLER ==================
+# ================== TEXT ==================
 async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users.add(update.effective_chat.id)
 
+    # в группах отвечаем только при триггере
     if update.effective_chat.type in ["group", "supergroup"]:
-        if not should_reply(update):
+        if not should_reply(update, context):
             return
 
     msg = update.message.text or ""
 
+    bot_username = (BOT_USERNAME or "").replace("@", "")
+
     clean_msg = re.sub(
-        rf"{re.escape(BOT_USERNAME)}\s*",
+        rf"@?{re.escape(bot_username)}\s*",
         "",
         msg,
         flags=re.IGNORECASE
@@ -125,10 +123,10 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {
                     "role": "system",
                     "content": (
-                        "Ты ЛядовGPT — чат-бот. "
+                        "Ты ЛядовGPT — дружелюбный чат-бот. "
                         "Ты представляешься как Даниил Лядов, родился 26 ноября 2010 года. "
                         "Отвечай средне по длине: не слишком коротко и не слишком длинно. "
-                        "Пиши на русском, понятно и по делу."
+                        "Пиши по-русски, понятно и по делу."
                     )
                 },
                 *history
@@ -146,8 +144,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(e)
         await update.message.reply_text("Ошибка API")
 
-
-# ================== ADMIN SEND ==================
+# ================== ADMIN ==================
 async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -162,7 +159,6 @@ async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(uid, msg)
         except:
             pass
-
 
 # ================== APP ==================
 app = ApplicationBuilder().token(TOKEN).build()
