@@ -58,7 +58,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             messages=[
                 {
                     "role": "system",
-                    "content": "Ты ЛядовGPT. Отвечай кратко, на русском."
+                    "content": "Ты ЛядовGPT. Отвечай на русском. Можно материться."
                 },
                 {
                     "role": "user",
