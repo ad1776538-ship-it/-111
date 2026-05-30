@@ -17,25 +17,23 @@ import re
 import base64
 
 # =========================================
-# CONFIG
+# ENV
 # =========================================
 
 TOKEN = os.getenv("8699789330:AAErx6x530YblxPi9x_tRRhDFsZ8b6s0Wvc")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OPENROUTER_API_KEY = ("OPENROUTER_API_KEY")
 
-BOT_USERNAME = "@lyadovgpt_bot"
-ADMIN_ID = 1033698004
+BOT_USERNAME = os.getenv("@lyadovgpt_bot")
+ADMIN_ID = int(os.getenv("1033698004"))
 
 # =========================================
-# OPENROUTER
+# OPENROUTER CLIENT
 # =========================================
 
 client = OpenAI(
-    api_key=GEMINI_API_KEY,
+    api_key=OPENROUTER_API_KEY,
     base_url="https://openrouter.ai/api/v1"
 )
-
-MODEL = "google/gemini-2.5-flash-lite"
 
 # =========================================
 # MEMORY
@@ -78,9 +76,11 @@ async def is_mentioned(update: Update, context: ContextTypes.DEFAULT_TYPE):
         or ""
     )
 
+    # mention
     if BOT_USERNAME.lower() in text.lower():
         return True
 
+    # reply to bot
     if update.message.reply_to_message:
         try:
             me = await context.bot.get_me()
@@ -111,7 +111,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================
-# RESET
+# RESET MEMORY
 # =========================================
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -126,7 +126,7 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================
-# PHOTO
+# PHOTO HANDLER
 # =========================================
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -134,6 +134,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
 
+    # группы
     if update.effective_chat.type in ["group", "supergroup"]:
         if not await is_mentioned(update, context):
             return
@@ -153,10 +154,16 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await file.download_to_drive(temp_path)
 
+        image = Image.open(temp_path)
+
         caption = (
             update.message.caption
             or "Опиши подробно что изображено на фото."
         )
+
+        # =========================================
+        # MEMORY
+        # =========================================
 
         history = get_memory(user_id)
 
@@ -174,13 +181,21 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         prompt.append(caption)
 
+        # =========================================
+        # IMAGE -> BASE64
+        # =========================================
+
         with open(temp_path, "rb") as img_file:
-            image_base64 = base64.b64encode(
+            base64_image = base64.b64encode(
                 img_file.read()
             ).decode("utf-8")
 
+        # =========================================
+        # OPENROUTER REQUEST
+        # =========================================
+
         response = client.chat.completions.create(
-            model=MODEL,
+            model="google/gemini-2.5-flash-lite",
             messages=[
                 {
                     "role": "user",
@@ -192,7 +207,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/jpeg;base64,{image_base64}"
+                                "url": f"data:image/jpeg;base64,{base64_image}"
                             }
                         }
                     ]
@@ -201,6 +216,10 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         answer = response.choices[0].message.content
+
+        # =========================================
+        # SAVE MEMORY
+        # =========================================
 
         history.append({
             "role": "user",
@@ -227,7 +246,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================
-# TEXT
+# TEXT HANDLER
 # =========================================
 
 async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -235,6 +254,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
 
+    # группы
     if update.effective_chat.type in ["group", "supergroup"]:
         if not await is_mentioned(update, context):
             return
@@ -273,7 +293,7 @@ async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
         response = client.chat.completions.create(
-            model=MODEL,
+            model="google/gemini-2.5-flash-lite",
             messages=[
                 {
                     "role": "user",
@@ -332,7 +352,7 @@ async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================================
-# COMMANDS
+# COMMANDS MENU
 # =========================================
 
 async def post_init(application):
