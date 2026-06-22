@@ -33,8 +33,12 @@ def ask_ai(user_id: int, user_message: str) -> str:
     )
 
     data = response.json()
-    reply = data["choices"][0]["message"]["content"]
 
+    # Подробный вывод ошибки
+    if "choices" not in data:
+        raise Exception(f"Ответ OpenRouter: {data}")
+
+    reply = data["choices"][0]["message"]["content"]
     user_histories[user_id].append({"role": "assistant", "content": reply})
 
     return reply
