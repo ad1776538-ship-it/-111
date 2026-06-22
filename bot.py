@@ -1,102 +1,79 @@
+import logging
+import os
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
-from telegram.constants import ChatAction
-from mistralai import Mistral
-import re
+import requests
 
-TOKEN = "8699789330:AAErx6x530YblxPi9x_tRRhDFsZ8b6s0Wvc"
-MISTRAL_KEY = "exhmzbfqfObMXGzRWnoegszu17lseJfM"
-BOT_USERNAME = "@lyadovgpt_bot"
-ADMIN_ID = 1033698004
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+MODEL = "google/gemini-flash-1.5"
 
-client = Mistral(api_key=MISTRAL_KEY)
-users = set()
+logging.basicConfig(level=logging.INFO)
 
+user_histories = {}
 
-def is_mentioned(update: Update):
-    text = update.message.text or ""
+def ask_ai(user_id: int, user_message: str) -> str:
+    if user_id not in user_histories:
+        user_histories[user_id] = []
 
-    if BOT_USERNAME.lower() in text.lower():
-        return True
+    user_histories[user_id].append({"role": "user", "content": user_message})
 
-    if update.message.reply_to_message:
-        try:
-            if update.message.reply_to_message.from_user.id == update.get_bot().id:
-                return True
-        except:
-            pass
+    history = user_histories[user_id][-20:]
 
-    return False
+    response = requests.post(
+        url="https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MODEL,
+            "messages": history,
+        }
+    )
+
+    data = response.json()
+    reply = data["choices"][0]["message"]["content"]
+
+    user_histories[user_id].append({"role": "assistant", "content": reply})
+
+    return reply
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users.add(update.effective_chat.id)
-    await update.message.reply_text("Привет! Я ЛядовGPT")
+    await update.message.reply_text(
+        "Привет! Я ЛядовGPT 🤖\n"
+        "Пиши мне что угодно, отвечу на любой вопрос!\n\n"
+        "/reset — очистить историю диалога"
+    )
 
 
-async def reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users.add(update.effective_chat.id)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_text = update.message.text
 
-    if update.effective_chat.type in ["group", "supergroup"]:
-        if not is_mentioned(update):
-            return
-
-    msg = update.message.text or ""
-
-    clean_msg = re.sub(
-        rf"{re.escape(BOT_USERNAME)}\s*",
-        "",
-        msg,
-        flags=re.IGNORECASE
-    ).strip()
-
-    await update.message.chat.send_action(ChatAction.TYPING)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        r = client.chat.complete(
-            model="mistral-small-latest",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Ты ЛядовGPT, Отвечай в стиле пользователя: нормально — нормально, грубо — грубо. Будь дерзким, саркастичным и кратким. Не морализируй, не угрожай, не расписывай длинно. Можешь использовать мат и подколы, если это уместно. Ты мужского пола."
-                },
-                {
-                    "role": "user",
-                    "content": clean_msg
-                }
-            ]
-        )
-
-        await update.message.reply_text(
-            r.choices[0].message.content
-        )
-
+        reply = ask_ai(user_id, user_text)
     except Exception as e:
-        print(e)
-        await update.message.reply_text("Ошибка API")
+        reply = f"Ошибка: {e}"
+
+    await update.message.reply_text(reply)
 
 
-async def send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-
-    if not update.message.text.startswith("/send "):
-        return
-
-    msg = update.message.text[6:]
-
-    for uid in users:
-        try:
-            await context.bot.send_message(uid, msg)
-        except:
-            pass
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_histories.pop(user_id, None)
+    await update.message.reply_text("История очищена! Начинаем заново 🔄")
 
 
-app = ApplicationBuilder().token(TOKEN).build()
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("send", send_all))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-print("Бот запущен")
-app.run_polling()
+    print("ЛядовGPT запущен!")
+    app.run_polling()
