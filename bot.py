@@ -1,22 +1,45 @@
 import logging
 import os
+import base64
+import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
-import requests
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-MODEL = "google/gemini-flash-1.5"
+MODEL = "openai/gpt-4o-mini"
 
 logging.basicConfig(level=logging.INFO)
 
 user_histories = {}
 
-def ask_ai(user_id: int, user_message: str) -> str:
+
+def is_mentioned(update: Update, context) -> bool:
+    """Проверяет — бота упомянули или ответили на его сообщение."""
+    message = update.effective_message
+    bot_username = context.bot.username
+
+    # Ответ на сообщение бота
+    if message.reply_to_message and message.reply_to_message.from_user.username == bot_username:
+        return True
+
+    # @упоминание бота
+    if message.entities:
+        for entity in message.entities:
+            if entity.type == "mention":
+                mentioned = message.text[entity.offset:entity.offset + entity.length]
+                if mentioned.lower() == f"@{bot_username.lower()}":
+                    return True
+
+    return False
+
+
+def ask_ai(user_id: int, content) -> str:
+    """Отправляет сообщение (текст или фото) в OpenRouter."""
     if user_id not in user_histories:
         user_histories[user_id] = []
 
-    user_histories[user_id].append({"role": "user", "content": user_message})
+    user_histories[user_id].append({"role": "user", "content": content})
 
     history = user_histories[user_id][-20:]
 
@@ -34,7 +57,6 @@ def ask_ai(user_id: int, user_message: str) -> str:
 
     data = response.json()
 
-    # Подробный вывод ошибки
     if "choices" not in data:
         raise Exception(f"Ответ OpenRouter: {data}")
 
@@ -47,23 +69,72 @@ def ask_ai(user_id: int, user_message: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я ЛядовGPT 🤖\n"
-        "Пиши мне что угодно, отвечу на любой вопрос!\n\n"
+        "Пиши мне что угодно, отвечу на любой вопрос!\n"
+        "Можешь отправить фото — тоже отвечу 📸\n\n"
         "/reset — очистить историю диалога"
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat_type = update.effective_chat.type
+
+    # В группе — только на упоминание или ответ
+    if chat_type in ("group", "supergroup"):
+        if not is_mentioned(update, context):
+            return
+
     user_id = update.effective_user.id
-    user_text = update.message.text
+    # Убираем @упоминание из текста если есть
+    text = message.text.replace(f"@{context.bot.username}", "").strip()
 
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
 
     try:
-        reply = ask_ai(user_id, user_text)
+        reply = ask_ai(user_id, text)
     except Exception as e:
         reply = f"Ошибка: {e}"
 
-    await update.message.reply_text(reply)
+    await message.reply_text(reply)
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat_type = update.effective_chat.type
+
+    # В группе — только на упоминание или ответ
+    if chat_type in ("group", "supergroup"):
+        if not is_mentioned(update, context):
+            return
+
+    user_id = update.effective_user.id
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        # Скачиваем фото
+        photo = message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        file_bytes = await file.download_as_bytearray()
+        image_base64 = base64.b64encode(file_bytes).decode("utf-8")
+
+        caption = message.caption or "Что на этом фото?"
+
+        content = [
+            {"type": "text", "text": caption},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{image_base64}"
+                }
+            }
+        ]
+
+        reply = ask_ai(user_id, content)
+    except Exception as e:
+        reply = f"Ошибка: {e}"
+
+    await message.reply_text(reply)
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -77,7 +148,8 @@ if __name__ == "__main__":
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     print("ЛядовGPT запущен!")
     app.run_polling()
