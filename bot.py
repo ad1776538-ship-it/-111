@@ -14,42 +14,46 @@ MODEL = "google/gemini-3.1-flash-lite"
 logging.basicConfig(level=logging.INFO)
 
 user_histories = {}
-known_users = set()
 
-USERS_FILE = "users.json"
+# Храним отдельно личные чаты и группы
+known_chats = set()   # все chat_id (личка + группы)
 
-
-def load_users():
-    global known_users
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r") as f:
-            known_users = set(json.load(f))
+CHATS_FILE = "chats.json"
 
 
-def save_users():
-    with open(USERS_FILE, "w") as f:
-        json.dump(list(known_users), f)
+def load_chats():
+    global known_chats
+    if os.path.exists(CHATS_FILE):
+        with open(CHATS_FILE, "r") as f:
+            known_chats = set(json.load(f))
 
 
-def register_user(user_id: int):
-    if user_id not in known_users:
-        known_users.add(user_id)
-        save_users()
+def save_chats():
+    with open(CHATS_FILE, "w") as f:
+        json.dump(list(known_chats), f)
+
+
+def register_chat(chat_id: int):
+    if chat_id not in known_chats:
+        known_chats.add(chat_id)
+        save_chats()
 
 
 def is_mentioned(update: Update, context) -> bool:
     message = update.effective_message
     bot_username = context.bot.username
 
-    if message.reply_to_message and message.reply_to_message.from_user.username == bot_username:
+    if message.reply_to_message and message.reply_to_message.from_user and \
+       message.reply_to_message.from_user.username == bot_username:
         return True
 
-    if message.entities:
-        for entity in message.entities:
-            if entity.type == "mention":
-                mentioned = message.text[entity.offset:entity.offset + entity.length]
-                if mentioned.lower() == f"@{bot_username.lower()}":
-                    return True
+    entities = message.entities or message.caption_entities or []
+    text = message.text or message.caption or ""
+    for entity in entities:
+        if entity.type == "mention":
+            mentioned = text[entity.offset:entity.offset + entity.length]
+            if mentioned.lower() == f"@{bot_username.lower()}":
+                return True
 
     return False
 
@@ -67,38 +71,30 @@ def ask_ai(user_id: int, content) -> str:
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": MODEL,
-            "messages": history,
-        }
+        json={"model": MODEL, "messages": history}
     )
 
     data = response.json()
-
     if "choices" not in data:
         raise Exception(f"Ответ OpenRouter: {data}")
 
     reply = data["choices"][0]["message"]["content"]
     user_histories[user_id].append({"role": "assistant", "content": reply})
-
     return reply
 
 
 def ask_ai_with_audio(user_id: int, audio_base64: str, mime_type: str = "audio/ogg") -> str:
-    """Отправляет аудио напрямую в Gemini через OpenRouter."""
     if user_id not in user_histories:
         user_histories[user_id] = []
 
     content = [
         {
             "type": "text",
-            "text": "Это голосовое сообщение. Сначала расшифруй что сказано, потом ответь на это как ИИ-ассистент."
+            "text": "Это голосовое сообщение. Ответь на него как ИИ-ассистент. Не пиши расшифровку, сразу отвечай по смыслу."
         },
         {
             "type": "image_url",
-            "image_url": {
-                "url": f"data:{mime_type};base64,{audio_base64}"
-            }
+            "image_url": {"url": f"data:{mime_type};base64,{audio_base64}"}
         }
     ]
 
@@ -111,20 +107,15 @@ def ask_ai_with_audio(user_id: int, audio_base64: str, mime_type: str = "audio/o
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
             "Content-Type": "application/json",
         },
-        json={
-            "model": MODEL,
-            "messages": history,
-        }
+        json={"model": MODEL, "messages": history}
     )
 
     data = response.json()
-
     if "choices" not in data:
         raise Exception(f"Ответ OpenRouter: {data}")
 
     reply = data["choices"][0]["message"]["content"]
     user_histories[user_id].append({"role": "assistant", "content": reply})
-
     return reply
 
 
@@ -137,13 +128,13 @@ async def setup_commands(app):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    register_user(user_id)
+    chat_id = update.effective_chat.id
+    register_chat(chat_id)
     await update.message.reply_text(
         "Привет! Я ЛядовGPT 🤖\n"
         "Пиши мне что угодно — отвечу на любой вопрос!\n\n"
         "📸 Отправь фото — опишу что на нём\n"
-        "🎤 Отправь голосовое — расшифрую и отвечу\n\n"
+        "🎤 Отправь голосовое — отвечу\n\n"
         "/clear — очистить историю диалога"
     )
 
@@ -151,17 +142,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat_type = update.effective_chat.type
+    chat_id = update.effective_chat.id
 
     if chat_type in ("group", "supergroup"):
         if not is_mentioned(update, context):
             return
 
+    register_chat(chat_id)
     user_id = update.effective_user.id
-    register_user(user_id)
-
     text = message.text.replace(f"@{context.bot.username}", "").strip()
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
         reply = ask_ai(user_id, text)
@@ -174,15 +165,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat_type = update.effective_chat.type
+    chat_id = update.effective_chat.id
 
     if chat_type in ("group", "supergroup"):
         if not is_mentioned(update, context):
             return
 
+    register_chat(chat_id)
     user_id = update.effective_user.id
-    register_user(user_id)
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
         photo = message.photo[-1]
@@ -191,15 +183,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_base64 = base64.b64encode(file_bytes).decode("utf-8")
 
         caption = message.caption or "Что на этом фото? Опиши подробно."
-
         content = [
             {"type": "text", "text": caption},
-            {
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:image/jpeg;base64,{image_base64}"
-                }
-            }
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
         ]
 
         reply = ask_ai(user_id, content)
@@ -210,18 +196,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает голосовые сообщения через Gemini (поддерживает аудио нативно)."""
     message = update.effective_message
     chat_type = update.effective_chat.type
+    chat_id = update.effective_chat.id
 
     if chat_type in ("group", "supergroup"):
         if not is_mentioned(update, context):
             return
 
+    register_chat(chat_id)
     user_id = update.effective_user.id
-    register_user(user_id)
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
         voice = message.voice
@@ -236,6 +222,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(reply)
 
 
+async def handle_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Регистрирует любой чат/пользователя даже без /start."""
+    chat_id = update.effective_chat.id
+    register_chat(chat_id)
+
+
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_histories.pop(user_id, None)
@@ -243,7 +235,7 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Рассылка всем пользователям. Только для админа. Команда скрыта из меню."""
+    """Рассылка во все чаты и группы. Только для админа."""
     user_id = update.effective_user.id
 
     if ADMIN_ID == 0 or user_id != ADMIN_ID:
@@ -253,21 +245,16 @@ async def send(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = " ".join(context.args)
-    sent = 0
-    failed = 0
 
-    for uid in list(known_users):
+    for chat_id in list(known_chats):
         try:
-            await context.bot.send_message(chat_id=uid, text=text)
-            sent += 1
+            await context.bot.send_message(chat_id=chat_id, text=text)
         except Exception:
-            failed += 1
-
-    await update.message.reply_text(f"✅ {sent} доставлено, {failed} не доставлено.")
+            pass
 
 
 if __name__ == "__main__":
-    load_users()
+    load_chats()
 
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.post_init = setup_commands
@@ -278,6 +265,8 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    # Регистрируем все входящие сообщения для сохранения chat_id
+    app.add_handler(MessageHandler(filters.ALL, handle_any))
 
     print("ЛядовGPT запущен!")
     app.run_polling()
