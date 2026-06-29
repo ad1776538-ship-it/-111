@@ -8,35 +8,11 @@ from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, Con
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 MODEL = "google/gemini-3.1-flash-lite"
 
 logging.basicConfig(level=logging.INFO)
 
 user_histories = {}
-
-# Храним отдельно личные чаты и группы
-known_chats = set()   # все chat_id (личка + группы)
-
-CHATS_FILE = "chats.json"
-
-
-def load_chats():
-    global known_chats
-    if os.path.exists(CHATS_FILE):
-        with open(CHATS_FILE, "r") as f:
-            known_chats = set(json.load(f))
-
-
-def save_chats():
-    with open(CHATS_FILE, "w") as f:
-        json.dump(list(known_chats), f)
-
-
-def register_chat(chat_id: int):
-    if chat_id not in known_chats:
-        known_chats.add(chat_id)
-        save_chats()
 
 
 def is_mentioned(update: Update, context) -> bool:
@@ -128,8 +104,6 @@ async def setup_commands(app):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    register_chat(chat_id)
     await update.message.reply_text(
         "Привет! Я ЛядовGPT 🤖\n"
         "Пиши мне что угодно — отвечу на любой вопрос!\n\n"
@@ -148,7 +122,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_mentioned(update, context):
             return
 
-    register_chat(chat_id)
     user_id = update.effective_user.id
     text = message.text.replace(f"@{context.bot.username}", "").strip()
 
@@ -171,7 +144,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_mentioned(update, context):
             return
 
-    register_chat(chat_id)
     user_id = update.effective_user.id
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -204,7 +176,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_mentioned(update, context):
             return
 
-    register_chat(chat_id)
     user_id = update.effective_user.id
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -222,51 +193,21 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(reply)
 
 
-async def handle_any(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Регистрирует любой чат/пользователя даже без /start."""
-    chat_id = update.effective_chat.id
-    register_chat(chat_id)
-
-
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_histories.pop(user_id, None)
     await update.message.reply_text("🔄 История очищена! Начинаем заново.")
 
 
-async def send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Рассылка во все чаты и группы. Только для админа."""
-    user_id = update.effective_user.id
-
-    if ADMIN_ID == 0 or user_id != ADMIN_ID:
-        return
-
-    if not context.args:
-        return
-
-    text = " ".join(context.args)
-
-    for chat_id in list(known_chats):
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=text)
-        except Exception:
-            pass
-
-
 if __name__ == "__main__":
-    load_chats()
-
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.post_init = setup_commands
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
-    app.add_handler(CommandHandler("send", send))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    # Регистрируем все входящие сообщения для сохранения chat_id
-    app.add_handler(MessageHandler(filters.ALL, handle_any))
 
     print("ЛядовGPT запущен!")
     app.run_polling()
