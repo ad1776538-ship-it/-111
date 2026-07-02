@@ -3,12 +3,14 @@ import os
 import base64
 import requests
 import json
+from io import BytesIO
 from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 MODEL = "google/gemini-3.1-flash-lite"
+IMAGE_MODEL = "google/gemini-2.5-flash-image"  # модель для генерации картинок на OpenRouter
 
 logging.basicConfig(level=logging.INFO)
 
@@ -95,10 +97,43 @@ def ask_ai_with_audio(user_id: int, audio_base64: str, mime_type: str = "audio/o
     return reply
 
 
+def generate_image(prompt: str) -> bytes:
+    """Генерирует изображение через OpenRouter (Gemini image-модель) и возвращает байты PNG/JPEG."""
+    response = requests.post(
+        url="https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": IMAGE_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "modalities": ["image", "text"],
+        }
+    )
+
+    data = response.json()
+    if "choices" not in data:
+        raise Exception(f"Ответ OpenRouter: {data}")
+
+    message = data["choices"][0]["message"]
+    images = message.get("images")
+    if not images:
+        # Модель не вернула картинку — обычно значит, что не поняла запрос как просьбу нарисовать
+        text_reply = message.get("content", "")
+        raise Exception(f"Изображение не получено. Ответ модели: {text_reply}")
+
+    image_url = images[0]["image_url"]["url"]  # формат: data:image/png;base64,XXXXX
+    header, encoded = image_url.split(",", 1)
+    image_bytes = base64.b64decode(encoded)
+    return image_bytes
+
+
 async def setup_commands(app):
     commands = [
         BotCommand("start", "Запустить бота"),
         BotCommand("clear", "Очистить историю диалога"),
+        BotCommand("image", "Сгенерировать изображение по описанию"),
     ]
     await app.bot.set_my_commands(commands)
 
@@ -108,7 +143,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! Я ЛядовGPT 🤖\n"
         "Пиши мне что угодно — отвечу на любой вопрос!\n\n"
         "📸 Отправь фото — опишу что на нём\n"
-        "🎤 Отправь голосовое — отвечу\n\n"
+        "🎤 Отправь голосовое — отвечу\n"
+        "🎨 /image <описание> — сгенерирую изображение\n\n"
         "/clear — очистить историю диалога"
     )
 
@@ -193,6 +229,24 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(reply)
 
 
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    chat_id = update.effective_chat.id
+
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await message.reply_text("Напиши описание после команды, например:\n/image рыжий кот в скафандре на луне")
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+
+    try:
+        image_bytes = generate_image(prompt)
+        await message.reply_photo(photo=BytesIO(image_bytes), caption=f"🎨 {prompt}")
+    except Exception as e:
+        await message.reply_text(f"Не получилось сгенерировать изображение: {e}")
+
+
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_histories.pop(user_id, None)
@@ -205,6 +259,7 @@ if __name__ == "__main__":
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
+    app.add_handler(CommandHandler("image", image_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
