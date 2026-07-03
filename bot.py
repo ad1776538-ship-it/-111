@@ -3,16 +3,49 @@ import os
 import base64
 import requests
 import json
-from telegram import Update, BotCommand
+from io import BytesIO
+from datetime import datetime
+from telegram import Update, BotCommand, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, ContextTypes, filters
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 MODEL = "google/gemini-3.1-flash-lite"
+IMAGE_MODEL = "google/gemini-2.5-flash-image"  # модель для генерации картинок на OpenRouter
+MUSIC_MODEL = "google/lyria-3-clip-preview"  # модель для генерации коротких (~30 сек) музыкальных клипов
 
 logging.basicConfig(level=logging.INFO)
 
 user_histories = {}
+
+DAILY_LIMIT = 1  # лимит генераций в день на пользователя (отдельно для фото и музыки)
+daily_usage = {}  # user_id -> {"date": "YYYY-MM-DD", "image": int, "music": int}
+pending_action = {}  # user_id -> "image" | "music" (ждём от пользователя описание после нажатия кнопки)
+
+IMAGE_BUTTON_TEXT = "🎨 Сгенерировать фото"
+MUSIC_BUTTON_TEXT = "🎵 Сгенерировать музыку"
+
+main_keyboard = ReplyKeyboardMarkup(
+    [[IMAGE_BUTTON_TEXT, MUSIC_BUTTON_TEXT]],
+    resize_keyboard=True
+)
+
+
+def check_and_use_limit(user_id: int, kind: str) -> bool:
+    """Возвращает True и списывает лимит, если генерация сегодня ещё доступна."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    entry = daily_usage.setdefault(user_id, {"date": today, "image": 0, "music": 0})
+
+    if entry["date"] != today:
+        entry["date"] = today
+        entry["image"] = 0
+        entry["music"] = 0
+
+    if entry[kind] >= DAILY_LIMIT:
+        return False
+
+    entry[kind] += 1
+    return True
 
 
 def is_mentioned(update: Update, context) -> bool:
@@ -95,10 +128,89 @@ def ask_ai_with_audio(user_id: int, audio_base64: str, mime_type: str = "audio/o
     return reply
 
 
+def generate_image(prompt: str) -> bytes:
+    """Генерирует изображение через OpenRouter (Gemini image-модель) и возвращает байты PNG/JPEG."""
+    response = requests.post(
+        url="https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": IMAGE_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "modalities": ["image", "text"],
+        }
+    )
+
+    data = response.json()
+    if "choices" not in data:
+        raise Exception(f"Ответ OpenRouter: {data}")
+
+    message = data["choices"][0]["message"]
+    images = message.get("images")
+    if not images:
+        # Модель не вернула картинку — обычно значит, что не поняла запрос как просьбу нарисовать
+        text_reply = message.get("content", "")
+        raise Exception(f"Изображение не получено. Ответ модели: {text_reply}")
+
+    image_url = images[0]["image_url"]["url"]  # формат: data:image/png;base64,XXXXX
+    header, encoded = image_url.split(",", 1)
+    image_bytes = base64.b64decode(encoded)
+    return image_bytes
+
+
+def generate_music(prompt: str) -> bytes:
+    """Генерирует короткий (~30 сек) музыкальный клип через OpenRouter (Lyria) и возвращает байты аудио (wav)."""
+    response = requests.post(
+        url="https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MUSIC_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "modalities": ["text", "audio"],
+            "audio": {"format": "wav"},
+            "stream": True,
+        },
+        stream=True,
+    )
+
+    audio_data_chunks = []
+
+    for line in response.iter_lines():
+        if not line:
+            continue
+        decoded = line.decode("utf-8")
+        if not decoded.startswith("data: "):
+            continue
+        data = decoded[len("data: "):]
+        if data.strip() == "[DONE]":
+            break
+        chunk = json.loads(data)
+        choices = chunk.get("choices")
+        if not choices:
+            continue
+        delta = choices[0].get("delta", {})
+        audio = delta.get("audio", {})
+        if audio.get("data"):
+            audio_data_chunks.append(audio["data"])
+
+    if not audio_data_chunks:
+        raise Exception("Аудио не получено от модели")
+
+    full_audio_b64 = "".join(audio_data_chunks)
+    return base64.b64decode(full_audio_b64)
+
+
 async def setup_commands(app):
     commands = [
         BotCommand("start", "Запустить бота"),
         BotCommand("clear", "Очистить историю диалога"),
+        BotCommand("image", "Сгенерировать изображение по описанию"),
+        BotCommand("music", "Сгенерировать музыкальный клип (~30 сек)"),
     ]
     await app.bot.set_my_commands(commands)
 
@@ -108,8 +220,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Привет! Я ЛядовGPT 🤖\n"
         "Пиши мне что угодно — отвечу на любой вопрос!\n\n"
         "📸 Отправь фото — опишу что на нём\n"
-        "🎤 Отправь голосовое — отвечу\n\n"
-        "/clear — очистить историю диалога"
+        "🎤 Отправь голосовое — отвечу\n"
+        "🎨 /image <описание> — сгенерирую изображение (кнопка ниже тоже работает)\n"
+        "🎵 /music <описание> — сгенерирую музыкальный клип (~30 сек)\n\n"
+        "/clear — очистить историю диалога",
+        reply_markup=main_keyboard
     )
 
 
@@ -117,13 +232,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     chat_type = update.effective_chat.type
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    text = message.text.strip()
+
+    # Нажатие кнопки "Сгенерировать фото" / "Сгенерировать музыку"
+    if text == IMAGE_BUTTON_TEXT:
+        pending_action[user_id] = "image"
+        await message.reply_text("🎨 Опиши, что нарисовать, и просто отправь сообщение:")
+        return
+
+    if text == MUSIC_BUTTON_TEXT:
+        pending_action[user_id] = "music"
+        await message.reply_text("🎵 Опиши, какую музыку сгенерировать, и просто отправь сообщение:")
+        return
+
+    # Пользователь ранее нажал кнопку и сейчас прислал описание
+    if user_id in pending_action:
+        action = pending_action.pop(user_id)
+        if action == "image":
+            await do_generate_image(update, context, text)
+        else:
+            await do_generate_music(update, context, text)
+        return
 
     if chat_type in ("group", "supergroup"):
         if not is_mentioned(update, context):
             return
 
-    user_id = update.effective_user.id
-    text = message.text.replace(f"@{context.bot.username}", "").strip()
+    text = text.replace(f"@{context.bot.username}", "").strip()
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
@@ -193,6 +329,72 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await message.reply_text(reply)
 
 
+async def do_generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
+    message = update.effective_message
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    if not check_and_use_limit(user_id, "image"):
+        await message.reply_text(
+            f"⛔ Лимит на сегодня исчерпан ({DAILY_LIMIT} фото в день). Приходи завтра!",
+            reply_markup=main_keyboard
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="upload_photo")
+
+    try:
+        image_bytes = generate_image(prompt)
+        await message.reply_photo(photo=BytesIO(image_bytes), caption=f"🎨 {prompt}", reply_markup=main_keyboard)
+    except Exception as e:
+        await message.reply_text(f"Не получилось сгенерировать изображение: {e}", reply_markup=main_keyboard)
+
+
+async def do_generate_music(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
+    message = update.effective_message
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    if not check_and_use_limit(user_id, "music"):
+        await message.reply_text(
+            f"⛔ Лимит на сегодня исчерпан ({DAILY_LIMIT} трек в день). Приходи завтра!",
+            reply_markup=main_keyboard
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="upload_voice")
+    await message.reply_text("🎵 Генерирую клип, это может занять до минуты...")
+
+    try:
+        audio_bytes = generate_music(prompt)
+        filename = f"music_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+        audio_file = BytesIO(audio_bytes)
+        audio_file.name = filename
+        await message.reply_audio(audio=audio_file, title=prompt[:60], caption=f"🎵 {prompt}", reply_markup=main_keyboard)
+    except Exception as e:
+        await message.reply_text(f"Не получилось сгенерировать музыку: {e}", reply_markup=main_keyboard)
+
+
+async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.effective_message.reply_text(
+            "Напиши описание после команды, например:\n/image рыжий кот в скафандре на луне"
+        )
+        return
+    await do_generate_image(update, context, prompt)
+
+
+async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    prompt = " ".join(context.args).strip()
+    if not prompt:
+        await update.effective_message.reply_text(
+            "Напиши описание после команды, например:\n/music энергичный синтвейв с ударными"
+        )
+        return
+    await do_generate_music(update, context, prompt)
+
+
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_histories.pop(user_id, None)
@@ -205,6 +407,8 @@ if __name__ == "__main__":
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
+    app.add_handler(CommandHandler("image", image_command))
+    app.add_handler(CommandHandler("music", music_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
