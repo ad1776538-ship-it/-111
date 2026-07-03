@@ -135,94 +135,113 @@ def ask_ai_with_audio(user_id: int, audio_base64: str, mime_type: str = "audio/o
     return reply
 
 
-def generate_image(prompt: str) -> bytes:
-    """Генерирует изображение через OpenRouter (Gemini image-модель) и возвращает байты PNG/JPEG."""
-    response = requests.post(
-        url="https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": IMAGE_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "modalities": ["image", "text"],
-        }
-    )
+def generate_image(prompt: str, retries: int = 1) -> bytes:
+    """Генерирует изображение через OpenRouter (Gemini image-модель) и возвращает байты PNG/JPEG.
+    Превью-модель иногда отвечает только текстом без картинки — в этом случае пробуем ещё раз."""
+    last_error = None
 
-    data = response.json()
-    if "choices" not in data:
-        raise Exception(f"Ответ OpenRouter: {data}")
+    for attempt in range(retries):
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": IMAGE_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "modalities": ["image", "text"],
+            }
+        )
 
-    message = data["choices"][0]["message"]
-    images = message.get("images")
-    if not images:
-        # Модель не вернула картинку — обычно значит, что не поняла запрос как просьбу нарисовать
+        data = response.json()
+        if "choices" not in data:
+            last_error = Exception(f"Ответ OpenRouter: {data}")
+            continue
+
+        message = data["choices"][0]["message"]
+        images = message.get("images")
+
+        if images:
+            image_url = images[0]["image_url"]["url"]  # формат: data:image/png;base64,XXXXX
+            header, encoded = image_url.split(",", 1)
+            return base64.b64decode(encoded)
+
+        # Модель не вернула картинку — запомним ответ и попробуем ещё раз
         text_reply = message.get("content", "")
-        raise Exception(f"Изображение не получено. Ответ модели: {text_reply}")
+        last_error = Exception(f"модель не вернула изображение (ответ: «{text_reply[:150]}»)")
 
-    image_url = images[0]["image_url"]["url"]  # формат: data:image/png;base64,XXXXX
-    header, encoded = image_url.split(",", 1)
-    image_bytes = base64.b64decode(encoded)
-    return image_bytes
+    raise last_error
 
 
-def generate_music(prompt: str) -> bytes:
-    """Генерирует короткий (~30 сек) музыкальный клип через OpenRouter (Lyria) и возвращает байты аудио (wav)."""
-    response = requests.post(
-        url="https://openrouter.ai/api/v1/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "model": MUSIC_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "modalities": ["text", "audio"],
-            "audio": {"format": "wav"},
-            "stream": True,
-        },
-        stream=True,
-    )
+def generate_music(prompt: str, retries: int = 1) -> bytes:
+    """Генерирует короткий (~30 сек) музыкальный клип через OpenRouter (Lyria) и возвращает байты аудио (wav).
+    При отсутствии аудио в ответе (частый глюк превью-модели) пробует ещё раз."""
+    last_error = None
 
-    audio_data_chunks = []
-    text_chunks = []
+    for attempt in range(retries):
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MUSIC_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "modalities": ["text", "audio"],
+                "audio": {"format": "wav"},
+                "stream": True,
+            },
+            stream=True,
+        )
 
-    for line in response.iter_lines():
-        if not line:
+        audio_data_chunks = []
+        text_chunks = []
+        api_error = None
+
+        for line in response.iter_lines():
+            if not line:
+                continue
+            decoded = line.decode("utf-8")
+            if not decoded.startswith("data: "):
+                continue
+            data = decoded[len("data: "):]
+            if data.strip() == "[DONE]":
+                break
+            chunk = json.loads(data)
+
+            if "error" in chunk:
+                api_error = chunk["error"]
+                break
+
+            choices = chunk.get("choices")
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+
+            audio = delta.get("audio", {})
+            if audio.get("data"):
+                audio_data_chunks.append(audio["data"])
+
+            if delta.get("content"):
+                text_chunks.append(delta["content"])
+
+        if api_error:
+            last_error = Exception(f"ошибка API: {api_error}")
             continue
-        decoded = line.decode("utf-8")
-        if not decoded.startswith("data: "):
-            continue
-        data = decoded[len("data: "):]
-        if data.strip() == "[DONE]":
-            break
-        chunk = json.loads(data)
 
-        if "error" in chunk:
-            raise Exception(f"Ошибка API: {chunk['error']}")
+        if audio_data_chunks:
+            full_audio_b64 = "".join(audio_data_chunks)
+            return base64.b64decode(full_audio_b64)
 
-        choices = chunk.get("choices")
-        if not choices:
-            continue
-        delta = choices[0].get("delta", {})
-
-        audio = delta.get("audio", {})
-        if audio.get("data"):
-            audio_data_chunks.append(audio["data"])
-
-        if delta.get("content"):
-            text_chunks.append(delta["content"])
-
-    if not audio_data_chunks:
         refusal_text = "".join(text_chunks).strip()
         if refusal_text:
-            # Модель ответила текстом вместо аудио — скорее всего отказ из-за содержания промпта
-            raise Exception(f"модель отказалась генерировать: «{refusal_text[:200]}»")
-        raise Exception("аудио не получено от модели, попробуйте другое описание")
+            last_error = Exception(f"модель ответила текстом вместо аудио: «{refusal_text[:150]}»")
+        else:
+            last_error = Exception("аудио не получено от модели")
 
-    full_audio_b64 = "".join(audio_data_chunks)
-    return base64.b64decode(full_audio_b64)
+    raise last_error
 
 
 async def setup_commands(app):
