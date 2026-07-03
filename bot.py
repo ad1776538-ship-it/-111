@@ -31,8 +31,8 @@ main_keyboard = ReplyKeyboardMarkup(
 )
 
 
-def check_and_use_limit(user_id: int, kind: str) -> bool:
-    """Возвращает True и списывает лимит, если генерация сегодня ещё доступна."""
+def has_limit_left(user_id: int, kind: str) -> bool:
+    """Проверяет, есть ли ещё лимит на сегодня, не списывая его."""
     today = datetime.now().strftime("%Y-%m-%d")
     entry = daily_usage.setdefault(user_id, {"date": today, "image": 0, "music": 0})
 
@@ -41,11 +41,18 @@ def check_and_use_limit(user_id: int, kind: str) -> bool:
         entry["image"] = 0
         entry["music"] = 0
 
-    if entry[kind] >= DAILY_LIMIT:
-        return False
+    return entry[kind] < DAILY_LIMIT
 
+
+def consume_limit(user_id: int, kind: str):
+    """Списывает лимит (вызывать только после успешной генерации)."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    entry = daily_usage.setdefault(user_id, {"date": today, "image": 0, "music": 0})
+    if entry["date"] != today:
+        entry["date"] = today
+        entry["image"] = 0
+        entry["music"] = 0
     entry[kind] += 1
-    return True
 
 
 def is_mentioned(update: Update, context) -> bool:
@@ -179,6 +186,7 @@ def generate_music(prompt: str) -> bytes:
     )
 
     audio_data_chunks = []
+    text_chunks = []
 
     for line in response.iter_lines():
         if not line:
@@ -190,16 +198,28 @@ def generate_music(prompt: str) -> bytes:
         if data.strip() == "[DONE]":
             break
         chunk = json.loads(data)
+
+        if "error" in chunk:
+            raise Exception(f"Ошибка API: {chunk['error']}")
+
         choices = chunk.get("choices")
         if not choices:
             continue
         delta = choices[0].get("delta", {})
+
         audio = delta.get("audio", {})
         if audio.get("data"):
             audio_data_chunks.append(audio["data"])
 
+        if delta.get("content"):
+            text_chunks.append(delta["content"])
+
     if not audio_data_chunks:
-        raise Exception("Аудио не получено от модели")
+        refusal_text = "".join(text_chunks).strip()
+        if refusal_text:
+            # Модель ответила текстом вместо аудио — скорее всего отказ из-за содержания промпта
+            raise Exception(f"модель отказалась генерировать: «{refusal_text[:200]}»")
+        raise Exception("аудио не получено от модели, попробуйте другое описание")
 
     full_audio_b64 = "".join(audio_data_chunks)
     return base64.b64decode(full_audio_b64)
@@ -334,7 +354,7 @@ async def do_generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    if not check_and_use_limit(user_id, "image"):
+    if not has_limit_left(user_id, "image"):
         await message.reply_text(
             f"⛔ Лимит на сегодня исчерпан ({DAILY_LIMIT} фото в день). Приходи завтра!",
             reply_markup=main_keyboard
@@ -345,6 +365,7 @@ async def do_generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     try:
         image_bytes = generate_image(prompt)
+        consume_limit(user_id, "image")
         await message.reply_photo(photo=BytesIO(image_bytes), caption=f"🎨 {prompt}", reply_markup=main_keyboard)
     except Exception as e:
         await message.reply_text(f"Не получилось сгенерировать изображение: {e}", reply_markup=main_keyboard)
@@ -355,7 +376,7 @@ async def do_generate_music(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    if not check_and_use_limit(user_id, "music"):
+    if not has_limit_left(user_id, "music"):
         await message.reply_text(
             f"⛔ Лимит на сегодня исчерпан ({DAILY_LIMIT} трек в день). Приходи завтра!",
             reply_markup=main_keyboard
@@ -367,6 +388,7 @@ async def do_generate_music(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     try:
         audio_bytes = generate_music(prompt)
+        consume_limit(user_id, "music")
         filename = f"music_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
         audio_file = BytesIO(audio_bytes)
         audio_file.name = filename
