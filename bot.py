@@ -17,9 +17,14 @@ logging.basicConfig(level=logging.INFO)
 
 user_histories = {}
 
-DAILY_LIMIT = 1  # лимит генераций фото в день на пользователя
+DAILY_LIMIT = 1  # бесплатный лимит генераций фото в день на пользователя
 daily_usage = {}  # user_id -> {"date": "YYYY-MM-DD", "image": int}
+bonus_credits = {}  # user_id -> int (платные генерации, не сгорают в конце дня)
 pending_action = {}  # user_id -> "image" (ждём от пользователя описание после нажатия кнопки)
+
+# ID администраторов, которым разрешено выдавать платный доступ (командой /grant).
+# Возьми свой ID через команду /myid и впиши его сюда через запятую, например: "123456789,987654321"
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 
 IMAGE_BUTTON_TEXT = "🎨 Сгенерировать фото"
 
@@ -30,7 +35,7 @@ main_keyboard = ReplyKeyboardMarkup(
 
 
 def has_limit_left(user_id: int, kind: str) -> bool:
-    """Проверяет, есть ли ещё лимит на сегодня, не списывая его."""
+    """Проверяет, есть ли ещё бесплатный лимит на сегодня ИЛИ платные (бонусные) генерации."""
     today = datetime.now().strftime("%Y-%m-%d")
     entry = daily_usage.setdefault(user_id, {"date": today, "image": 0})
 
@@ -38,17 +43,25 @@ def has_limit_left(user_id: int, kind: str) -> bool:
         entry["date"] = today
         entry["image"] = 0
 
-    return entry[kind] < DAILY_LIMIT
+    if entry[kind] < DAILY_LIMIT:
+        return True
+
+    return bonus_credits.get(user_id, 0) > 0
 
 
 def consume_limit(user_id: int, kind: str):
-    """Списывает лимит (вызывать только после успешной генерации)."""
+    """Списывает лимит (вызывать только после успешной генерации).
+    Сначала тратит бесплатный дневной лимит, и только когда он исчерпан — платные генерации."""
     today = datetime.now().strftime("%Y-%m-%d")
     entry = daily_usage.setdefault(user_id, {"date": today, "image": 0})
     if entry["date"] != today:
         entry["date"] = today
         entry["image"] = 0
-    entry[kind] += 1
+
+    if entry[kind] < DAILY_LIMIT:
+        entry[kind] += 1
+    else:
+        bonus_credits[user_id] = max(0, bonus_credits.get(user_id, 0) - 1)
 
 
 def is_mentioned(update: Update, context) -> bool:
@@ -175,6 +188,8 @@ async def setup_commands(app):
         BotCommand("start", "Запустить бота"),
         BotCommand("clear", "Очистить историю диалога"),
         BotCommand("image", "Сгенерировать изображение по описанию"),
+        BotCommand("balance", "Проверить остаток генераций"),
+        BotCommand("myid", "Узнать свой Telegram ID"),
     ]
     await app.bot.set_my_commands(commands)
 
@@ -291,7 +306,8 @@ async def do_generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     if not has_limit_left(user_id, "image"):
         await message.reply_text(
-            f"⛔ Лимит на сегодня исчерпан ({DAILY_LIMIT} фото в день). Приходи завтра!",
+            f"⛔ Бесплатный лимит на сегодня исчерпан ({DAILY_LIMIT} фото в день).\n"
+            f"Проверить остаток: /balance",
             reply_markup=main_keyboard
         )
         return
@@ -316,6 +332,55 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await do_generate_image(update, context, prompt)
 
 
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    await update.effective_message.reply_text(f"Твой Telegram ID: `{user_id}`", parse_mode="Markdown")
+
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    today = datetime.now().strftime("%Y-%m-%d")
+    entry = daily_usage.get(user_id, {"date": today, "image": 0})
+    free_left = DAILY_LIMIT - entry["image"] if entry.get("date") == today else DAILY_LIMIT
+    free_left = max(0, free_left)
+    bonus = bonus_credits.get(user_id, 0)
+
+    await update.effective_message.reply_text(
+        f"🎨 Бесплатных генераций сегодня: {free_left}\n"
+        f"💰 Платных (бонусных) генераций: {bonus}"
+    )
+
+
+async def grant(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    sender_id = update.effective_user.id
+
+    if sender_id not in ADMIN_IDS:
+        await message.reply_text("⛔ Эта команда только для администратора.")
+        return
+
+    if len(context.args) < 2:
+        await message.reply_text(
+            "Использование:\n/grant <user_id> <количество>\n\n"
+            "Пример: /grant 123456789 5\n"
+            "Чтобы выдать себе — узнай свой ID через /myid"
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+        amount = int(context.args[1])
+    except ValueError:
+        await message.reply_text("user_id и количество должны быть числами.")
+        return
+
+    bonus_credits[target_id] = bonus_credits.get(target_id, 0) + amount
+    await message.reply_text(
+        f"✅ Пользователю {target_id} выдано {amount} доп. генераций.\n"
+        f"Всего у него теперь: {bonus_credits[target_id]}"
+    )
+
+
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_histories.pop(user_id, None)
@@ -329,6 +394,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("image", image_command))
+    app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("grant", grant))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
