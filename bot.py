@@ -392,7 +392,13 @@ async def do_generate_music(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         filename = f"music_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
         audio_file = BytesIO(audio_bytes)
         audio_file.name = filename
-        await message.reply_audio(audio=audio_file, title=prompt[:60], caption=f"🎵 {prompt}", reply_markup=main_keyboard)
+        await message.reply_audio(
+            audio=audio_file,
+            title=prompt[:60],
+            performer="ЛядовGPT",
+            caption=f"🎵 {prompt}",
+            reply_markup=main_keyboard
+        )
     except Exception as e:
         await message.reply_text(f"Не получилось сгенерировать музыку: {e}", reply_markup=main_keyboard)
 
