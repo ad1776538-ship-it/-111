@@ -12,21 +12,19 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 MODEL = "google/gemini-3.1-flash-lite"
 IMAGE_MODEL = "google/gemini-2.5-flash-image"  # модель для генерации картинок на OpenRouter
-MUSIC_MODEL = "google/lyria-3-clip-preview"  # модель для генерации коротких (~30 сек) музыкальных клипов
 
 logging.basicConfig(level=logging.INFO)
 
 user_histories = {}
 
-DAILY_LIMIT = 1  # лимит генераций в день на пользователя (отдельно для фото и музыки)
-daily_usage = {}  # user_id -> {"date": "YYYY-MM-DD", "image": int, "music": int}
-pending_action = {}  # user_id -> "image" | "music" (ждём от пользователя описание после нажатия кнопки)
+DAILY_LIMIT = 1  # лимит генераций фото в день на пользователя
+daily_usage = {}  # user_id -> {"date": "YYYY-MM-DD", "image": int}
+pending_action = {}  # user_id -> "image" (ждём от пользователя описание после нажатия кнопки)
 
 IMAGE_BUTTON_TEXT = "🎨 Сгенерировать фото"
-MUSIC_BUTTON_TEXT = "🎵 Сгенерировать музыку"
 
 main_keyboard = ReplyKeyboardMarkup(
-    [[IMAGE_BUTTON_TEXT, MUSIC_BUTTON_TEXT]],
+    [[IMAGE_BUTTON_TEXT]],
     resize_keyboard=True
 )
 
@@ -34,12 +32,11 @@ main_keyboard = ReplyKeyboardMarkup(
 def has_limit_left(user_id: int, kind: str) -> bool:
     """Проверяет, есть ли ещё лимит на сегодня, не списывая его."""
     today = datetime.now().strftime("%Y-%m-%d")
-    entry = daily_usage.setdefault(user_id, {"date": today, "image": 0, "music": 0})
+    entry = daily_usage.setdefault(user_id, {"date": today, "image": 0})
 
     if entry["date"] != today:
         entry["date"] = today
         entry["image"] = 0
-        entry["music"] = 0
 
     return entry[kind] < DAILY_LIMIT
 
@@ -47,11 +44,10 @@ def has_limit_left(user_id: int, kind: str) -> bool:
 def consume_limit(user_id: int, kind: str):
     """Списывает лимит (вызывать только после успешной генерации)."""
     today = datetime.now().strftime("%Y-%m-%d")
-    entry = daily_usage.setdefault(user_id, {"date": today, "image": 0, "music": 0})
+    entry = daily_usage.setdefault(user_id, {"date": today, "image": 0})
     if entry["date"] != today:
         entry["date"] = today
         entry["image"] = 0
-        entry["music"] = 0
     entry[kind] += 1
 
 
@@ -174,82 +170,11 @@ def generate_image(prompt: str, retries: int = 1) -> bytes:
     raise last_error
 
 
-def generate_music(prompt: str, retries: int = 1) -> bytes:
-    """Генерирует короткий (~30 сек) музыкальный клип через OpenRouter (Lyria) и возвращает байты аудио (wav).
-    При отсутствии аудио в ответе (частый глюк превью-модели) пробует ещё раз."""
-    last_error = None
-
-    for attempt in range(retries):
-        response = requests.post(
-            url="https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": MUSIC_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "modalities": ["text", "audio"],
-                "audio": {"format": "wav"},
-                "stream": True,
-            },
-            stream=True,
-        )
-
-        audio_data_chunks = []
-        text_chunks = []
-        api_error = None
-
-        for line in response.iter_lines():
-            if not line:
-                continue
-            decoded = line.decode("utf-8")
-            if not decoded.startswith("data: "):
-                continue
-            data = decoded[len("data: "):]
-            if data.strip() == "[DONE]":
-                break
-            chunk = json.loads(data)
-
-            if "error" in chunk:
-                api_error = chunk["error"]
-                break
-
-            choices = chunk.get("choices")
-            if not choices:
-                continue
-            delta = choices[0].get("delta", {})
-
-            audio = delta.get("audio", {})
-            if audio.get("data"):
-                audio_data_chunks.append(audio["data"])
-
-            if delta.get("content"):
-                text_chunks.append(delta["content"])
-
-        if api_error:
-            last_error = Exception(f"ошибка API: {api_error}")
-            continue
-
-        if audio_data_chunks:
-            full_audio_b64 = "".join(audio_data_chunks)
-            return base64.b64decode(full_audio_b64)
-
-        refusal_text = "".join(text_chunks).strip()
-        if refusal_text:
-            last_error = Exception(f"модель ответила текстом вместо аудио: «{refusal_text[:150]}»")
-        else:
-            last_error = Exception("аудио не получено от модели")
-
-    raise last_error
-
-
 async def setup_commands(app):
     commands = [
         BotCommand("start", "Запустить бота"),
         BotCommand("clear", "Очистить историю диалога"),
         BotCommand("image", "Сгенерировать изображение по описанию"),
-        BotCommand("music", "Сгенерировать музыкальный клип (~30 сек)"),
     ]
     await app.bot.set_my_commands(commands)
 
@@ -260,8 +185,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Пиши мне что угодно — отвечу на любой вопрос!\n\n"
         "📸 Отправь фото — опишу что на нём\n"
         "🎤 Отправь голосовое — отвечу\n"
-        "🎨 /image <описание> — сгенерирую изображение (кнопка ниже тоже работает)\n"
-        "🎵 /music <описание> — сгенерирую музыкальный клип (~30 сек)\n\n"
+        "🎨 /image <описание> — сгенерирую изображение (кнопка ниже тоже работает)\n\n"
         "/clear — очистить историю диалога",
         reply_markup=main_keyboard
     )
@@ -274,24 +198,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = message.text.strip()
 
-    # Нажатие кнопки "Сгенерировать фото" / "Сгенерировать музыку"
+    # Нажатие кнопки "Сгенерировать фото"
     if text == IMAGE_BUTTON_TEXT:
         pending_action[user_id] = "image"
         await message.reply_text("🎨 Опиши, что нарисовать, и просто отправь сообщение:")
         return
 
-    if text == MUSIC_BUTTON_TEXT:
-        pending_action[user_id] = "music"
-        await message.reply_text("🎵 Опиши, какую музыку сгенерировать, и просто отправь сообщение:")
-        return
-
     # Пользователь ранее нажал кнопку и сейчас прислал описание
     if user_id in pending_action:
-        action = pending_action.pop(user_id)
-        if action == "image":
-            await do_generate_image(update, context, text)
-        else:
-            await do_generate_music(update, context, text)
+        pending_action.pop(user_id)
+        await do_generate_image(update, context, text)
         return
 
     if chat_type in ("group", "supergroup"):
@@ -390,38 +306,6 @@ async def do_generate_image(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await message.reply_text(f"Не получилось сгенерировать изображение: {e}", reply_markup=main_keyboard)
 
 
-async def do_generate_music(update: Update, context: ContextTypes.DEFAULT_TYPE, prompt: str):
-    message = update.effective_message
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-
-    if not has_limit_left(user_id, "music"):
-        await message.reply_text(
-            f"⛔ Лимит на сегодня исчерпан ({DAILY_LIMIT} трек в день). Приходи завтра!",
-            reply_markup=main_keyboard
-        )
-        return
-
-    await context.bot.send_chat_action(chat_id=chat_id, action="upload_voice")
-    await message.reply_text("🎵 Генерирую клип, это может занять до минуты...")
-
-    try:
-        audio_bytes = generate_music(prompt)
-        consume_limit(user_id, "music")
-        filename = f"music_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-        audio_file = BytesIO(audio_bytes)
-        audio_file.name = filename
-        await message.reply_audio(
-            audio=audio_file,
-            title=prompt[:60],
-            performer="ЛядовGPT",
-            caption=f"🎵 {prompt}",
-            reply_markup=main_keyboard
-        )
-    except Exception as e:
-        await message.reply_text(f"Не получилось сгенерировать музыку: {e}", reply_markup=main_keyboard)
-
-
 async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = " ".join(context.args).strip()
     if not prompt:
@@ -430,16 +314,6 @@ async def image_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     await do_generate_image(update, context, prompt)
-
-
-async def music_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prompt = " ".join(context.args).strip()
-    if not prompt:
-        await update.effective_message.reply_text(
-            "Напиши описание после команды, например:\n/music энергичный синтвейв с ударными"
-        )
-        return
-    await do_generate_music(update, context, prompt)
 
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -455,7 +329,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("image", image_command))
-    app.add_handler(CommandHandler("music", music_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
